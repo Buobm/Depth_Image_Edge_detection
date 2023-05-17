@@ -43,6 +43,15 @@ class Deep_Edge_Detector():
         output = self.model(torch.from_numpy(image.T).unsqueeze(0).to(self.device))
         image = output[-1].squeeze().detach().cpu().numpy().T
         return image
+    
+    def get_nonEdges(self, inp_image: np.array) -> np.array:
+        output = self.model(torch.from_numpy(inp_image.T).unsqueeze(0).to(self.device))
+        img = output[-1]
+
+        th_img = img <= 0
+        th_img = th_img.squeeze().detach().cpu().numpy().astype(np.uint8).T
+
+        return th_img
 
 def testPich(checkpoint_path, dataloader, model, device, output_dir, args):
     # a test model plus the interganged channels
@@ -383,11 +392,12 @@ if __name__ == '__main__':
     # Get image, convert to float
     image = cv2.imread(imagepath)
     image = image.astype(np.float32)
-    image = (image - np.min(image)) / np.max(image)
+    image = (image - np.min(image)) / np.max(image) * 255
     
     detectron_2000 = Deep_Edge_Detector(checkpoint_path)
-    edges = detectron_2000.predict(image)
+    edges = detectron_2000.get_nonEdges(image)
 
-    plt.imshow(edges)
+    plt.imshow(edges, cmap='gray')
     plt.show()
 
+    
