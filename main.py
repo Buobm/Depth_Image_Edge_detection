@@ -397,6 +397,14 @@ if __name__ == '__main__':
     detectron_2000 = Deep_Edge_Detector(checkpoint_path)
     edges = detectron_2000.get_nonEdges(image)
 
+    thresholdValue = 50
+    thresholdmask = (image <= thresholdValue).astype(np.uint8)
+
+    masked_image = thresholdmask * image
+    
+    cv2.imwrite('masked_depth.png', masked_image)
+    cv2.imwrite('mask.png',thresholdmask*255)
+
     plt.imshow(edges, cmap='gray')
     plt.show()
 

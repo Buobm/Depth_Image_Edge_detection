@@ -279,9 +279,3 @@ if __name__ == '__main__':
     model = DexiNed().to(device)
     output = model(input)
     print(f"output shapes: {[t.shape for t in output]}")
-
-    # for i in range(20000):
-    #     print(i)
-    #     output = model(input)
-    #     loss = nn.MSELoss()(output[-1], target)
-    #     loss.backward()
