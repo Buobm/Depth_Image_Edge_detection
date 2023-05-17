@@ -13,57 +13,36 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 
+from matplotlib import pyplot as plt
+
+
 from model import DexiNed
 # from utils import (image_normalization, save_image_batch_to_disk,
 #                    visualize_result,count_parameters)
 
 IS_LINUX = True if platform.system()=="Linux" else False
 
-class deep_edge_detector():
-def test(checkpoint_path, image: np.array) -:
-    device = torch.device('cpu' if torch.cuda.device_count() == 0
-                          else 'cuda')
+class Deep_Edge_Detector():
+    #load weights and init model
+    def __init__(self, checkpoint_path) -> None:
+        self.device = torch.device('cpu' if torch.cuda.device_count() == 0
+                            else 'cuda')
 
-    if not os.path.isfile(checkpoint_path):
-        raise FileNotFoundError(
-            f"Checkpoint filte note found: {checkpoint_path}")
-    print(f"Restoring weights from: {checkpoint_path}")
-    model = torch.load(checkpoint_path, map_location=device)
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(
+                f"Checkpoint filte note found: {checkpoint_path}")
+        print(f"loaded weights from: {checkpoint_path}")
+        self.model = DexiNed().to(device)
+        self.model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
-    # Put model in evaluation mode
-    model.eval()
-    output = model(input)
+        # Put model in evaluation mode
+        self.model.eval()
 
-    with torch.no_grad():
-        total_duration = []
-        for batch_id, sample_batched in enumerate(dataloader):
-            images = sample_batched['images'].to(device)
-            if not args.test_data == "CLASSIC":
-                labels = sample_batched['labels'].to(device)
-            file_names = sample_batched['file_names']
-            image_shape = sample_batched['image_shape']
-            print(f"input tensor shape: {images.shape}")
-            # images = images[:, [2, 1, 0], :, :]
 
-            end = time.perf_counter()
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            preds = model(images)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            tmp_duration = time.perf_counter() - end
-            total_duration.append(tmp_duration)
-
-            save_image_batch_to_disk(preds,
-                                     output_dir,
-                                     file_names,
-                                     image_shape,
-                                     arg=args)
-            torch.cuda.empty_cache()
-
-    total_duration = np.sum(np.array(total_duration))
-    print("******** Testing finished in", args.test_data, "dataset. *****")
-    print("FPS: %f.4" % (len(dataloader)/total_duration))
+    def predict(self, image : np.array) -> np.array:
+        output = self.model(torch.from_numpy(image.T).unsqueeze(0).to(self.device))
+        image = output[-1].squeeze().detach().cpu().numpy().T
+        return image
 
 def testPich(checkpoint_path, dataloader, model, device, output_dir, args):
     # a test model plus the interganged channels
@@ -390,6 +369,10 @@ def main(args):
     print(num_param)
     print('-------------------------------------------------------')
 
+def normalize(image):
+    image = (image - np.min(image)) / np.max(image)
+    return image
+
 if __name__ == '__main__':
     device = torch.device('cpu' if torch.cuda.device_count() == 0
                           else 'cuda')
@@ -401,12 +384,10 @@ if __name__ == '__main__':
     image = cv2.imread(imagepath)
     image = image.astype(np.float32)
     image = (image - np.min(image)) / np.max(image)
+    
+    detectron_2000 = Deep_Edge_Detector(checkpoint_path)
+    edges = detectron_2000.predict(image)
 
-    # Initialize Model
-    model = DexiNed().to(device)
-    model.load_state_dict(torch.load(checkpoint_path,
-                                         map_location=device))
-    
-    output = model(torch.from_numpy(image.T).unsqueeze(0).to(device))
-    pass
-    
+    plt.imshow(edges)
+    plt.show()
+
