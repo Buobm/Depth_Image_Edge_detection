@@ -14,8 +14,8 @@ from torch.utils.data import DataLoader
 
 
 from model import DexiNed
-from utils import (image_normalization, save_image_batch_to_disk,
-                   visualize_result,count_parameters)
+# from utils import (image_normalization, save_image_batch_to_disk,
+#                    visualize_result,count_parameters)
 
 IS_LINUX = True if platform.system()=="Linux" else False
 
@@ -391,9 +391,22 @@ def main(args):
     print('-------------------------------------------------------')
 
 if __name__ == '__main__':
-    # args = parse_args()
-    # main(args)
-    checkpoint_path = "checkpoint/10_model.pth"
-    image = np.array() 
+    device = torch.device('cpu' if torch.cuda.device_count() == 0
+                          else 'cuda')
 
-    test(checkpoint_path, image, model, device, output_dir, args)
+    checkpoint_path = "checkpoint/10_model.pth"
+    imagepath = 'dataset/depth_Images_normalized/000000.png'
+
+    # Get image, convert to float
+    image = cv2.imread(imagepath)
+    image = image.astype(np.float32)
+    image = (image - np.min(image)) / np.max(image)
+
+    # Initialize Model
+    model = DexiNed().to(device)
+    model.load_state_dict(torch.load(checkpoint_path,
+                                         map_location=device))
+    
+    output = model(torch.from_numpy(image.T).unsqueeze(0).to(device))
+    pass
+    

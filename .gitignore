@@ -9,6 +9,9 @@ __pycache__/
 # weights
 *.pth
 .vscode
+
+# data
+dataset/depth_Images_normalized/*.png
 # Distribution / packaging
 .Python
 build/
