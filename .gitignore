@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# weights
+*.pth
+.vscode
 # Distribution / packaging
 .Python
 build/
