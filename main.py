@@ -19,8 +19,8 @@ from model import DexiNed
 
 IS_LINUX = True if platform.system()=="Linux" else False
 
-
-def test(checkpoint_path, image: np.array, output_dir, args):
+class deep_edge_detector():
+def test(checkpoint_path, image: np.array) -:
     device = torch.device('cpu' if torch.cuda.device_count() == 0
                           else 'cuda')
 
