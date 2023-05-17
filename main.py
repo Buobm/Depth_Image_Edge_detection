@@ -1,26 +1,278 @@
 ###Source: https://github.com/xavysp/DexiNed/tree/master
 from __future__ import print_function
 
-import argparse
 import os
-import time, platform
-
 import numpy as np
 
 import cv2
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-
 
 from matplotlib import pyplot as plt
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from model import DexiNed
-# from utils import (image_normalization, save_image_batch_to_disk,
-#                    visualize_result,count_parameters)
 
-IS_LINUX = True if platform.system()=="Linux" else False
+def weight_init(m):
+    if isinstance(m, (nn.Conv2d,)):
+        # torch.nn.init.xavier_uniform_(m.weight, gain=1.0)
+        torch.nn.init.xavier_normal_(m.weight, gain=1.0)
+        # torch.nn.init.normal_(m.weight, mean=0.0, std=0.01)
+        if m.weight.data.shape[1] == torch.Size([1]):
+            torch.nn.init.normal_(m.weight, mean=0.0)
+
+        if m.bias is not None:
+            torch.nn.init.zeros_(m.bias)
+
+    # for fusion layer
+    if isinstance(m, (nn.ConvTranspose2d,)):
+        # torch.nn.init.xavier_uniform_(m.weight, gain=1.0)
+        torch.nn.init.xavier_normal_(m.weight, gain=1.0)
+        # torch.nn.init.normal_(m.weight, mean=0.0, std=0.01)
+
+        if m.weight.data.shape[1] == torch.Size([1]):
+            torch.nn.init.normal_(m.weight, std=0.1)
+        if m.bias is not None:
+            torch.nn.init.zeros_(m.bias)
+
+
+class CoFusion(nn.Module):
+
+    def __init__(self, in_ch, out_ch):
+        super(CoFusion, self).__init__()
+        self.conv1 = nn.Conv2d(in_ch, 64, kernel_size=3,
+                               stride=1, padding=1)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=3,
+                               stride=1, padding=1)
+        self.conv3 = nn.Conv2d(64, out_ch, kernel_size=3,
+                               stride=1, padding=1)
+        self.relu = nn.ReLU()
+
+        self.norm_layer1 = nn.GroupNorm(4, 64)
+        self.norm_layer2 = nn.GroupNorm(4, 64)
+
+    def forward(self, x):
+        # fusecat = torch.cat(x, dim=1)
+        attn = self.relu(self.norm_layer1(self.conv1(x)))
+        attn = self.relu(self.norm_layer2(self.conv2(attn)))
+        attn = F.softmax(self.conv3(attn), dim=1)
+
+        # return ((fusecat * attn).sum(1)).unsqueeze(1)
+        return ((x * attn).sum(1)).unsqueeze(1)
+
+class _DenseLayer(nn.Sequential):
+    def __init__(self, input_features, out_features):
+        super(_DenseLayer, self).__init__()
+
+        # self.add_module('relu2', nn.ReLU(inplace=True)),
+        self.add_module('conv1', nn.Conv2d(input_features, out_features,
+                                           kernel_size=3, stride=1, padding=2, bias=True)),
+        self.add_module('norm1', nn.BatchNorm2d(out_features)),
+        self.add_module('relu1', nn.ReLU(inplace=True)),
+        self.add_module('conv2', nn.Conv2d(out_features, out_features,
+                                           kernel_size=3, stride=1, bias=True)),
+        self.add_module('norm2', nn.BatchNorm2d(out_features))
+
+    def forward(self, x):
+        x1, x2 = x
+
+        new_features = super(_DenseLayer, self).forward(F.relu(x1))  # F.relu()
+        # if new_features.shape[-1]!=x2.shape[-1]:
+        #     new_features =F.interpolate(new_features,size=(x2.shape[2],x2.shape[-1]), mode='bicubic',
+        #                                 align_corners=False)
+        return 0.5 * (new_features + x2), x2
+
+
+class _DenseBlock(nn.Sequential):
+    def __init__(self, num_layers, input_features, out_features):
+        super(_DenseBlock, self).__init__()
+        for i in range(num_layers):
+            layer = _DenseLayer(input_features, out_features)
+            self.add_module('denselayer%d' % (i + 1), layer)
+            input_features = out_features
+
+
+class UpConvBlock(nn.Module):
+    def __init__(self, in_features, up_scale):
+        super(UpConvBlock, self).__init__()
+        self.up_factor = 2
+        self.constant_features = 16
+
+        layers = self.make_deconv_layers(in_features, up_scale)
+        assert layers is not None, layers
+        self.features = nn.Sequential(*layers)
+
+    def make_deconv_layers(self, in_features, up_scale):
+        layers = []
+        all_pads=[0,0,1,3,7]
+        for i in range(up_scale):
+            kernel_size = 2 ** up_scale
+            pad = all_pads[up_scale]  # kernel_size-1
+            out_features = self.compute_out_features(i, up_scale)
+            layers.append(nn.Conv2d(in_features, out_features, 1))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.ConvTranspose2d(
+                out_features, out_features, kernel_size, stride=2, padding=pad))
+            in_features = out_features
+        return layers
+
+    def compute_out_features(self, idx, up_scale):
+        return 1 if idx == up_scale - 1 else self.constant_features
+
+    def forward(self, x):
+        return self.features(x)
+
+class SingleConvBlock(nn.Module):
+    def __init__(self, in_features, out_features, stride,
+                 use_bs=True
+                 ):
+        super(SingleConvBlock, self).__init__()
+        self.use_bn = use_bs
+        self.conv = nn.Conv2d(in_features, out_features, 1, stride=stride,
+                              bias=True)
+        self.bn = nn.BatchNorm2d(out_features)
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.use_bn:
+            x = self.bn(x)
+        return x
+
+
+class DoubleConvBlock(nn.Module):
+    def __init__(self, in_features, mid_features,
+                 out_features=None,
+                 stride=1,
+                 use_act=True):
+        super(DoubleConvBlock, self).__init__()
+
+        self.use_act = use_act
+        if out_features is None:
+            out_features = mid_features
+        self.conv1 = nn.Conv2d(in_features, mid_features,
+                               3, padding=1, stride=stride)
+        self.bn1 = nn.BatchNorm2d(mid_features)
+        self.conv2 = nn.Conv2d(mid_features, out_features, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_features)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        if self.use_act:
+            x = self.relu(x)
+        return x
+
+
+class DexiNed(nn.Module):
+    """ Definition of the DXtrem network. """
+
+    def __init__(self):
+        super(DexiNed, self).__init__()
+        self.block_1 = DoubleConvBlock(3, 32, 64, stride=2,)
+        self.block_2 = DoubleConvBlock(64, 128, use_act=False)
+        self.dblock_3 = _DenseBlock(2, 128, 256) # [128,256,100,100]
+        self.dblock_4 = _DenseBlock(3, 256, 512)
+        self.dblock_5 = _DenseBlock(3, 512, 512)
+        self.dblock_6 = _DenseBlock(3, 512, 256)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # left skip connections, figure in Journal
+        self.side_1 = SingleConvBlock(64, 128, 2)
+        self.side_2 = SingleConvBlock(128, 256, 2)
+        self.side_3 = SingleConvBlock(256, 512, 2)
+        self.side_4 = SingleConvBlock(512, 512, 1)
+        self.side_5 = SingleConvBlock(512, 256, 1) # Sory I forget to comment this line :(
+
+        # right skip connections, figure in Journal paper
+        self.pre_dense_2 = SingleConvBlock(128, 256, 2)
+        self.pre_dense_3 = SingleConvBlock(128, 256, 1)
+        self.pre_dense_4 = SingleConvBlock(256, 512, 1)
+        self.pre_dense_5 = SingleConvBlock(512, 512, 1)
+        self.pre_dense_6 = SingleConvBlock(512, 256, 1)
+
+
+        self.up_block_1 = UpConvBlock(64, 1)
+        self.up_block_2 = UpConvBlock(128, 1)
+        self.up_block_3 = UpConvBlock(256, 2)
+        self.up_block_4 = UpConvBlock(512, 3)
+        self.up_block_5 = UpConvBlock(512, 4)
+        self.up_block_6 = UpConvBlock(256, 4)
+        self.block_cat = SingleConvBlock(6, 1, stride=1, use_bs=False) # hed fusion method
+        # self.block_cat = CoFusion(6,6)# cats fusion method
+
+
+        self.apply(weight_init)
+
+    def slice(self, tensor, slice_shape):
+        t_shape = tensor.shape
+        height, width = slice_shape
+        if t_shape[-1]!=slice_shape[-1]:
+            new_tensor = F.interpolate(
+                tensor, size=(height, width), mode='bicubic',align_corners=False)
+        else:
+            new_tensor=tensor
+        # tensor[..., :height, :width]
+        return new_tensor
+
+    def forward(self, x):
+        assert x.ndim == 4, x.shape
+
+        # Block 1
+        block_1 = self.block_1(x)
+        block_1_side = self.side_1(block_1)
+
+        # Block 2
+        block_2 = self.block_2(block_1)
+        block_2_down = self.maxpool(block_2)
+        block_2_add = block_2_down + block_1_side
+        block_2_side = self.side_2(block_2_add)
+
+        # Block 3
+        block_3_pre_dense = self.pre_dense_3(block_2_down)
+        block_3, _ = self.dblock_3([block_2_add, block_3_pre_dense])
+        block_3_down = self.maxpool(block_3) # [128,256,50,50]
+        block_3_add = block_3_down + block_2_side
+        block_3_side = self.side_3(block_3_add)
+
+        # Block 4
+        block_2_resize_half = self.pre_dense_2(block_2_down)
+        block_4_pre_dense = self.pre_dense_4(block_3_down+block_2_resize_half)
+        block_4, _ = self.dblock_4([block_3_add, block_4_pre_dense])
+        block_4_down = self.maxpool(block_4)
+        block_4_add = block_4_down + block_3_side
+        block_4_side = self.side_4(block_4_add)
+
+        # Block 5
+        block_5_pre_dense = self.pre_dense_5(
+            block_4_down) #block_5_pre_dense_512 +block_4_down
+        block_5, _ = self.dblock_5([block_4_add, block_5_pre_dense])
+        block_5_add = block_5 + block_4_side
+
+        # Block 6
+        block_6_pre_dense = self.pre_dense_6(block_5)
+        block_6, _ = self.dblock_6([block_5_add, block_6_pre_dense])
+
+        # upsampling blocks
+        out_1 = self.up_block_1(block_1)
+        out_2 = self.up_block_2(block_2)
+        out_3 = self.up_block_3(block_3)
+        out_4 = self.up_block_4(block_4)
+        out_5 = self.up_block_5(block_5)
+        out_6 = self.up_block_6(block_6)
+        results = [out_1, out_2, out_3, out_4, out_5, out_6]
+
+        # concatenate multiscale outputs
+        block_cat = torch.cat(results, dim=1)  # Bx6xHxW
+        block_cat = self.block_cat(block_cat)  # Bx1xHxW
+
+        # return results
+        results.append(block_cat)
+        return results
+
 
 class Deep_Edge_Detector():
     #load weights and init model
@@ -52,335 +304,6 @@ class Deep_Edge_Detector():
         th_img = th_img.squeeze().detach().cpu().numpy().astype(np.uint8).T
 
         return th_img
-
-def testPich(checkpoint_path, dataloader, model, device, output_dir, args):
-    # a test model plus the interganged channels
-    if not os.path.isfile(checkpoint_path):
-        raise FileNotFoundError(
-            f"Checkpoint filte note found: {checkpoint_path}")
-    print(f"Restoring weights from: {checkpoint_path}")
-    model.load_state_dict(torch.load(checkpoint_path,
-                                     map_location=device))
-
-    # Put model in evaluation mode
-    model.eval()
-
-    with torch.no_grad():
-        total_duration = []
-        for batch_id, sample_batched in enumerate(dataloader):
-            images = sample_batched['images'].to(device)
-            if not args.test_data == "CLASSIC":
-                labels = sample_batched['labels'].to(device)
-            file_names = sample_batched['file_names']
-            image_shape = sample_batched['image_shape']
-            print(f"input tensor shape: {images.shape}")
-            start_time = time.time()
-            # images2 = images[:, [1, 0, 2], :, :]  #GBR
-            images2 = images[:, [2, 1, 0], :, :] # RGB
-            preds = model(images)
-            preds2 = model(images2)
-            tmp_duration = time.time() - start_time
-            total_duration.append(tmp_duration)
-            save_image_batch_to_disk([preds,preds2],
-                                     output_dir,
-                                     file_names,
-                                     image_shape,
-                                     arg=args, is_inchannel=True)
-            torch.cuda.empty_cache()
-
-    total_duration = np.array(total_duration)
-    print("******** Testing finished in", args.test_data, "dataset. *****")
-    print("Average time per image: %f.4" % total_duration.mean(), "seconds")
-    print("Time spend in the Dataset: %f.4" % total_duration.sum(), "seconds")
-
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='DexiNed trainer.')
-    parser.add_argument('--choose_test_data',
-                        type=int,
-                        default=-1,
-                        help='Already set the dataset for testing choice: 0 - 8')
-    # ----------- test -------0--
-
-
-    TEST_DATA = DATASET_NAMES[parser.parse_args().choose_test_data] # max 8
-    test_inf = dataset_info(TEST_DATA, is_linux=IS_LINUX)
-    test_dir = test_inf['data_dir']
-    is_testing =True#  current test -352-SM-NewGT-2AugmenPublish
-
-    # Training settings
-    TRAIN_DATA = DATASET_NAMES[0] # BIPED=0, MDBD=6
-    train_inf = dataset_info(TRAIN_DATA, is_linux=IS_LINUX)
-    train_dir = train_inf['data_dir']
-
-
-    # Data parameters
-    parser.add_argument('--input_dir',
-                        type=str,
-                        default=train_dir,
-                        help='the path to the directory with the input data.')
-    parser.add_argument('--input_val_dir',
-                        type=str,
-                        default=test_inf['data_dir'],
-                        help='the path to the directory with the input data for validation.')
-    parser.add_argument('--output_dir',
-                        type=str,
-                        default='checkpoints',
-                        help='the path to output the results.')
-    parser.add_argument('--train_data',
-                        type=str,
-                        choices=DATASET_NAMES,
-                        default=TRAIN_DATA,
-                        help='Name of the dataset.')
-    parser.add_argument('--test_data',
-                        type=str,
-                        choices=DATASET_NAMES,
-                        default=TEST_DATA,
-                        help='Name of the dataset.')
-    parser.add_argument('--test_list',
-                        type=str,
-                        default=test_inf['test_list'],
-                        help='Dataset sample indices list.')
-    parser.add_argument('--train_list',
-                        type=str,
-                        default=train_inf['train_list'],
-                        help='Dataset sample indices list.')
-    parser.add_argument('--is_testing',type=bool,
-                        default=is_testing,
-                        help='Script in testing mode.')
-    parser.add_argument('--double_img',
-                        type=bool,
-                        default=False,
-                        help='True: use same 2 imgs changing channels')  # Just for test
-    parser.add_argument('--resume',
-                        type=bool,
-                        default=False,
-                        help='use previous trained data')  # Just for test
-    parser.add_argument('--checkpoint_data',
-                        type=str,
-                        default='10/10_model.pth',# 4 6 7 9 14
-                        help='Checkpoint path from which to restore model weights from.')
-    parser.add_argument('--test_img_width',
-                        type=int,
-                        default=test_inf['img_width'],
-                        help='Image width for testing.')
-    parser.add_argument('--test_img_height',
-                        type=int,
-                        default=test_inf['img_height'],
-                        help='Image height for testing.')
-    parser.add_argument('--res_dir',
-                        type=str,
-                        default='result',
-                        help='Result directory')
-    parser.add_argument('--log_interval_vis',
-                        type=int,
-                        default=50,
-                        help='The number of batches to wait before printing test predictions.')
-
-    parser.add_argument('--epochs',
-                        type=int,
-                        default=17,
-                        metavar='N',
-                        help='Number of training epochs (default: 25).')
-    parser.add_argument('--lr',
-                        default=1e-4,
-                        type=float,
-                        help='Initial learning rate.')
-    parser.add_argument('--wd',
-                        type=float,
-                        default=1e-8,
-                        metavar='WD',
-                        help='weight decay (Good 1e-8) in TF1=0') # 1e-8 -> BIRND/MDBD, 0.0 -> BIPED
-    parser.add_argument('--adjust_lr',
-                        default=[10,15],
-                        type=int,
-                        help='Learning rate step size.') #[5,10]BIRND [10,15]BIPED/BRIND
-    parser.add_argument('--batch_size',
-                        type=int,
-                        default=8,
-                        metavar='B',
-                        help='the mini-batch size (default: 8)')
-    parser.add_argument('--workers',
-                        default=16,
-                        type=int,
-                        help='The number of workers for the dataloaders.')
-    parser.add_argument('--tensorboard',type=bool,
-                        default=True,
-                        help='Use Tensorboard for logging.'),
-    parser.add_argument('--img_width',
-                        type=int,
-                        default=352,
-                        help='Image width for training.') # BIPED 400 BSDS 352/320 MDBD 480
-    parser.add_argument('--img_height',
-                        type=int,
-                        default=352,
-                        help='Image height for training.') # BIPED 480 BSDS 352/320
-    parser.add_argument('--channel_swap',
-                        default=[2, 1, 0],
-                        type=int)
-    parser.add_argument('--crop_img',
-                        default=True,
-                        type=bool,
-                        help='If true crop training images, else resize images to match image width and height.')
-    parser.add_argument('--mean_pixel_values',
-                        default=[103.939,116.779,123.68, 137.86],
-                        type=float)  # [103.939,116.779,123.68] [104.00699, 116.66877, 122.67892]
-    args = parser.parse_args()
-    return args
-
-
-def main(args):
-    """Main function."""
-
-    print(f"Number of GPU's available: {torch.cuda.device_count()}")
-    print(f"Pytorch version: {torch.__version__}")
-
-    # Tensorboard summary writer
-
-    # tb_writer = None
-    # training_dir = os.path.join(args.output_dir,args.train_data)
-    # os.makedirs(training_dir,exist_ok=True)
-    # checkpoint_path = os.path.join(args.output_dir, args.train_data, args.checkpoint_data)
-    # if args.tensorboard and not args.is_testing:
-    #     from torch.utils.tensorboard import SummaryWriter # for torch 1.4 or greather
-    #     tb_writer = SummaryWriter(log_dir=training_dir)
-    #     # saving Model training settings
-    #     training_notes = ['DexiNed, Xavier Normal Init, LR= ' + str(args.lr) + ' WD= '
-    #                       + str(args.wd) + ' image size = ' + str(args.img_width)
-    #                       + ' adjust LR='+ str(args.adjust_lr) + ' Loss Function= BDCNloss2. '
-    #                       +'Trained on> '+args.train_data+' Tested on> '
-    #                       +args.test_data+' Batch size= '+str(args.batch_size)+' '+str(time.asctime())]
-    #     info_txt = open(os.path.join(training_dir, 'training_settings.txt'), 'w')
-    #     info_txt.write(str(training_notes))
-    #     info_txt.close()
-
-    # Get computing device
-    device = torch.device('cpu' if torch.cuda.device_count() == 0
-                          else 'cuda')
-
-    # Instantiate model and move it to the computing device
-    model = DexiNed().to(device)
-    # model = nn.DataParallel(model)
-    ini_epoch =0
-    if not args.is_testing:
-        if args.resume:
-            ini_epoch=11
-            model.load_state_dict(torch.load(checkpoint_path,
-                                         map_location=device))
-            print('Training restarted from> ',checkpoint_path)
-        dataset_train = BipedDataset(args.input_dir,
-                                     img_width=args.img_width,
-                                     img_height=args.img_height,
-                                     mean_bgr=args.mean_pixel_values[0:3] if len(
-                                         args.mean_pixel_values) == 4 else args.mean_pixel_values,
-                                     train_mode='train',
-                                     arg=args
-                                     )
-        dataloader_train = DataLoader(dataset_train,
-                                      batch_size=args.batch_size,
-                                      shuffle=True,
-                                      num_workers=args.workers)
-
-    dataset_val = TestDataset(args.input_val_dir,
-                              test_data=args.test_data,
-                              img_width=args.test_img_width,
-                              img_height=args.test_img_height,
-                              mean_bgr=args.mean_pixel_values[0:3] if len(
-                                  args.mean_pixel_values) == 4 else args.mean_pixel_values,
-                              test_list=args.test_list, arg=args
-                              )
-    dataloader_val = DataLoader(dataset_val,
-                                batch_size=1,
-                                shuffle=False,
-                                num_workers=args.workers)
-    # Testing
-    if args.is_testing:
-
-        output_dir = os.path.join(args.res_dir, args.train_data+"2"+ args.test_data)
-        print(f"output_dir: {output_dir}")
-        if args.double_img:
-            # predict twice an image changing channels, then mix those results
-            testPich(checkpoint_path, dataloader_val, model, device, output_dir, args)
-        else:
-            test(checkpoint_path, dataloader_val, model, device, output_dir, args)
-
-        num_param = count_parameters(model)
-        print('-------------------------------------------------------')
-        print('DexiNed # of Parameters:')
-        print(num_param)
-        print('-------------------------------------------------------')
-        return
-
-    criterion = bdcn_loss2 # hed_loss2 #bdcn_loss2
-
-    optimizer = optim.Adam(model.parameters(),
-                           lr=args.lr,
-                           weight_decay=args.wd)
-
-    # Main training loop
-    seed=1021
-    adjust_lr = args.adjust_lr
-    lr2= args.lr
-    for epoch in range(ini_epoch,args.epochs):
-        if epoch%7==0:
-
-            seed = seed+1000
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed(seed)
-            print("------ Random seed applied-------------")
-        # Create output directories
-        if adjust_lr is not None:
-            if epoch in adjust_lr:
-                lr2 = lr2*0.1
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr2
-
-        output_dir_epoch = os.path.join(args.output_dir,args.train_data, str(epoch))
-        img_test_dir = os.path.join(output_dir_epoch, args.test_data + '_res')
-        os.makedirs(output_dir_epoch,exist_ok=True)
-        os.makedirs(img_test_dir,exist_ok=True)
-        validate_one_epoch(epoch,
-                           dataloader_val,
-                           model,
-                           device,
-                           img_test_dir,
-                           arg=args)
-
-        avg_loss =train_one_epoch(epoch,
-                        dataloader_train,
-                        model,
-                        criterion,
-                        optimizer,
-                        device,
-                        args.log_interval_vis,
-                        tb_writer,
-                        args=args)
-        validate_one_epoch(epoch,
-                           dataloader_val,
-                           model,
-                           device,
-                           img_test_dir,
-                           arg=args)
-
-        # Save model after end of every epoch
-        torch.save(model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
-                   os.path.join(output_dir_epoch, '{0}_model.pth'.format(epoch)))
-        if tb_writer is not None:
-            tb_writer.add_scalar('loss',
-                                 avg_loss,
-                                 epoch+1)
-        print('Current learning rate> ', optimizer.param_groups[0]['lr'])
-    num_param = count_parameters(model)
-    print('-------------------------------------------------------')
-    print('DexiNed, # of Parameters:')
-    print(num_param)
-    print('-------------------------------------------------------')
-
-def normalize(image):
-    image = (image - np.min(image)) / np.max(image)
-    return image
 
 if __name__ == '__main__':
     device = torch.device('cpu' if torch.cuda.device_count() == 0
