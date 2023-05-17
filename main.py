@@ -19,8 +19,8 @@ from utils import (image_normalization, save_image_batch_to_disk,
 
 IS_LINUX = True if platform.system()=="Linux" else False
 
-
-def test(checkpoint_path, image: np.array, output_dir, args):
+class deep_edge_detector():
+def test(checkpoint_path, image: np.array) -:
     device = torch.device('cpu' if torch.cuda.device_count() == 0
                           else 'cuda')
 
@@ -394,6 +394,6 @@ if __name__ == '__main__':
     # args = parse_args()
     # main(args)
     checkpoint_path = "checkpoint/10_model.pth"
-    image = np.array() 
+    image = np.array()
 
-    test(checkpoint_path, image, model, device, output_dir, args)
+    test(checkpoint_path, image, output_dir, args)
