@@ -3,6 +3,7 @@ from __future__ import print_function
 
 import os
 import numpy as np
+import time
 
 import cv2
 
@@ -305,30 +306,68 @@ class Deep_Edge_Detector():
 
         return th_img
 
+def convert_gray_to_HSV(depth_image):
+    # Normalize the depth image to fall within the range 0-179 (to fit the hue range in HSV color space)
+    depth_image = depth_image[:,:,0]
+    # Normalize the depth image to fall within the range 0-179 (to fit the hue range in HSV color space)
+    normalized_depth_image = cv2.normalize(depth_image, None, 0, 179, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+
+    # Convert the single channel image to three channels
+    three_channel_depth_image = cv2.cvtColor(normalized_depth_image, cv2.COLOR_GRAY2BGR)
+
+    # Convert the three channel image to HSV
+    hsv_image = cv2.cvtColor(three_channel_depth_image, cv2.COLOR_BGR2HSV)
+
+    # Replace the hue channel with the depth image and set saturation and value to maximum
+    hsv_image[:, :, 0] = normalized_depth_image  # Hue
+    hsv_image[:, :, 1] = 255  # Saturation
+    hsv_image[:, :, 2] = 255  # Value
+
+    # Convert back to BGR
+    colored_depth_image = cv2.cvtColor(hsv_image, cv2.COLOR_HSV2BGR)
+    # Save the colored depth image
+    cv2.imwrite("colored_depth_image.png", colored_depth_image)
+
+    return colored_depth_image.astype(np.float32)
+def normalize(image):
+    image = (image - np.min(image)) / np.max(image) * 255
+    return image
+
 if __name__ == '__main__':
     device = torch.device('cpu' if torch.cuda.device_count() == 0
                           else 'cuda')
 
     checkpoint_path = "checkpoint/10_model.pth"
-    imagepath = 'dataset/depth_Images_normalized/000000.png'
+    imagepath = 'dataset/depth_Images_normalized/000938.png' #
 
     # Get image, convert to float
     image = cv2.imread(imagepath)
     image = image.astype(np.float32)
     image = (image - np.min(image)) / np.max(image) * 255
-    
-    detectron_2000 = Deep_Edge_Detector(checkpoint_path)
-    edges = detectron_2000.get_nonEdges(image)
 
-    thresholdValue = 50
+    rgb_image = cv2.imread('000938.png')
+    rgb_image = rgb_image.astype(np.float32)
+    rgb_image = normalize(rgb_image)
+    
+    # image = convert_gray_to_HSV(image)
+
+    detectron_2000 = Deep_Edge_Detector(checkpoint_path)
+    start = time.time()
+    edges = detectron_2000.get_nonEdges(rgb_image)
+    image = image[:,:,0]
+
+    thresholdValue = 100
     thresholdmask = (image <= thresholdValue).astype(np.uint8)
 
-    masked_image = thresholdmask * image
-    
-    cv2.imwrite('masked_depth.png', masked_image)
-    cv2.imwrite('mask.png',thresholdmask*255)
-
-    plt.imshow(edges, cmap='gray')
-    plt.show()
+    masked_image = thresholdmask * edges
+    image_thresholded = (255 - image) * thresholdmask
+    image_thresholded = normalize(image_thresholded)
+    resulting = (255 - image) * masked_image
+    print(time.time()- start)
+    cv2.imwrite('masked_depth.png', masked_image *255)
+    cv2.imwrite('image_thresholded.png', image_thresholded)
+    cv2.imwrite('mask.png', thresholdmask*255)
+    cv2.imwrite('resulting.png', resulting)
+    cv2.imwrite('edges.png', edges * 255)
 
     
