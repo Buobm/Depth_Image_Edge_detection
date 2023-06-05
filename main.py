@@ -7,6 +7,8 @@ import time
 
 import cv2
 
+import statistics
+
 from matplotlib import pyplot as plt
 
 import torch
@@ -340,6 +342,8 @@ if __name__ == '__main__':
     checkpoint_path = "checkpoint/10_model.pth"
     imagepath = 'dataset/depth_Images_normalized/000938.png' #
 
+    num_repetitions = 20 #min 10 itterations
+
     # Get image, convert to float
     image = cv2.imread(imagepath)
     image = image.astype(np.float32)
@@ -353,21 +357,44 @@ if __name__ == '__main__':
 
     detectron_2000 = Deep_Edge_Detector(checkpoint_path)
     start = time.time()
-    edges = detectron_2000.get_nonEdges(rgb_image)
+    dexined_time = []
+    for i in range(num_repetitions):
+        start_1 = time.time()
+        edges = detectron_2000.get_nonEdges(rgb_image) 
+        dexined_time.append(time.time()- start_1)
+    dexined_time_stable= dexined_time[10: -1]
+    dexined_mean = statistics.mean(dexined_time_stable)
+    print(f"DexiNed time per iteration: {dexined_mean}")
+
+    
     image = image[:,:,0]
+    canny_image = image.astype(np.uint8)
+
+    start = time.time()
+    for i in range(10):
+        edges_canny = cv2.Canny(canny_image, 5, 100)
+    print(f"Canny: {(time.time() - start)/10}")
+
+    # plt.subplot(121),plt.imshow(canny_image,cmap = 'gray')
+    # plt.title('Original Image'), plt.xticks([]), plt.yticks([])
+    # plt.subplot(122),plt.imshow(edges_canny,cmap = 'gray')
+    # plt.title('Edge Image'), plt.xticks([]), plt.yticks([])
+    # plt.show()
+
 
     thresholdValue = 100
-    thresholdmask = (image <= thresholdValue).astype(np.uint8)
-
+    start = time.time()
+    for i in range(1000):
+        thresholdmask = (image <= thresholdValue).astype(np.uint8)
+    print(f"dynamic treshold: {(time.time() - start)/1000}")
     masked_image = thresholdmask * edges
     image_thresholded = (255 - image) * thresholdmask
     image_thresholded = normalize(image_thresholded)
     resulting = (255 - image) * masked_image
-    print(time.time()- start)
+    
     cv2.imwrite('masked_depth.png', masked_image *255)
     cv2.imwrite('image_thresholded.png', image_thresholded)
     cv2.imwrite('mask.png', thresholdmask*255)
     cv2.imwrite('resulting.png', resulting)
     cv2.imwrite('edges.png', edges * 255)
-
-    
+    cv2.imwrite('canny.png', edges_canny)
